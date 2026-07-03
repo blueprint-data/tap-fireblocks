@@ -1,0 +1,16 @@
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# agent/IDE local state — not for the repo
+.atl/
+
+# generated output
+output.json
+
+# secrets — never commit real keys/config
+*.pem
+config.local.json
+.env
