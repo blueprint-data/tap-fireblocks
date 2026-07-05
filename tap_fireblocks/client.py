@@ -30,10 +30,23 @@ class FireblocksStream(RESTStream):
         Fireblocks returns a full URL in the ``next-page`` response header.
         When present, extract its query parameters so the next request uses
         the correct cursor.
+
+        For incremental streams (e.g. transactions), also passes the stored
+        bookmark as the ``after`` filter so the API only returns records
+        created after the last sync — avoiding an ever-growing full fetch.
         """
+        params: dict = {}
         if next_page_token and next_page_token.startswith("http"):
             parsed = urlparse(next_page_token)
             qs = parse_qs(parsed.query)
             # parse_qs returns lists; flatten to single values
-            return {k: v[0] for k, v in qs.items()}
-        return {}
+            params = {k: v[0] for k, v in qs.items()}
+
+        # Pass the last-seen replication value to the API as a filter.
+        # Falls back to start_date config on the very first run; skips the
+        # parameter entirely when neither a bookmark nor start_date exists.
+        start_time = self.get_starting_time(context)
+        if start_time:
+            params["after"] = str(int(start_time.timestamp() * 1000))
+
+        return params
