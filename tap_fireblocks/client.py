@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse
 
 from singer_sdk.streams import RESTStream
@@ -45,8 +46,18 @@ class FireblocksStream(RESTStream):
         # Pass the last-seen replication value to the API as a filter.
         # Falls back to start_date config on the very first run; skips the
         # parameter entirely when neither a bookmark nor start_date exists.
-        start_time = self.get_starting_time(context)
-        if start_time:
-            params["after"] = str(int(start_time.timestamp() * 1000))
+        if self.replication_key is not None:
+            start_value = self.get_starting_replication_key_value(context)
+            if start_value is not None:
+                if isinstance(start_value, (int, float)):
+                    params["after"] = str(int(start_value))
+                else:
+                    # Parse ISO datetime string (from start_date config).
+                    dt = datetime.fromisoformat(
+                        str(start_value).replace("Z", "+00:00"),
+                    )
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    params["after"] = str(int(dt.timestamp() * 1000))
 
         return params
