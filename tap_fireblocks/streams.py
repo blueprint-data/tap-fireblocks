@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from urllib.parse import parse_qs, urlparse
+
 from singer_sdk import typing as th
 
 from tap_fireblocks.client import FireblocksStream
@@ -85,12 +88,95 @@ NetworkIdInfo = th.ObjectType(
 
 
 class TransactionsStream(FireblocksStream):
-    """Transaction history."""
+    """Transaction history.
+
+    Fireblocks returns transactions in **descending** order (newest first),
+    with no way to request ascending.  The Singer SDK assumes ascending
+    data, so a large backfill can lose data if interrupted: the bookmark
+    reaches the newest transaction on the first page, and the next run
+    skips everything older.
+
+    This override uses **forward date-windowing** to walk chronologically
+    through bounded 24-hour windows.  A custom state key
+    ``tx_window_start_ms`` tracks progress.  When caught up to ``now``,
+    the key is cleared and normal incremental sync takes over.
+    """
 
     name = "transactions"
     path = "/v1/transactions"
     primary_keys = ["id"]
     replication_key = "createdAt"
+
+    #: Size of each backfill window in hours.
+    WINDOW_HOURS = 24
+
+    #: Custom state key for forward-windowing progress.
+    STATE_PROGRESS_KEY = "tx_window_start_ms"
+
+    def get_url_params(self, context, next_page_token) -> dict:
+        # Pagination: follow next-page cursor (same logic as base class).
+        if next_page_token and next_page_token.startswith("http"):
+            parsed = urlparse(next_page_token)
+            qs = parse_qs(parsed.query)
+            return {k: v[0] for k, v in qs.items()}
+
+        params: dict = {}
+        state = self.get_context_state(context)
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        window_ms = self.WINDOW_HOURS * 3600 * 1000
+        window_start: int | None = state.get(self.STATE_PROGRESS_KEY)
+
+        if window_start is not None:
+            # Backfill mode: bounded window.
+            after = int(window_start)
+            before = min(after + window_ms, now_ms)
+            params["after"] = str(after)
+            params["before"] = str(before)
+
+        else:
+            # First run or caught up: seed from bookmark / start_date.
+            start_value = self.get_starting_replication_key_value(context)
+            if start_value is not None:
+                if isinstance(start_value, (int, float)):
+                    after = int(start_value)
+                else:
+                    dt = datetime.fromisoformat(
+                        str(start_value).replace("Z", "+00:00"),
+                    )
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    after = int(dt.timestamp() * 1000)
+
+                before = min(after + window_ms, now_ms)
+                params["after"] = str(after)
+                params["before"] = str(before)
+
+                # Activate backfill mode.
+                state[self.STATE_PROGRESS_KEY] = after
+
+        return params
+
+    def finalize_state_progress_markers(  # type: ignore[override]
+        self,
+        state: dict | None = None,
+    ) -> None:
+        """Advance the date-windowing progress after a successful window."""
+        if state is None:
+            state = self.stream_state
+
+        progress = state.get(self.STATE_PROGRESS_KEY)
+        if progress is not None:
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            window_ms = self.WINDOW_HOURS * 3600 * 1000
+            next_progress = int(progress) + window_ms
+
+            if next_progress >= now_ms:
+                # Caught up to now → switch to normal incremental.
+                state.pop(self.STATE_PROGRESS_KEY, None)
+            else:
+                state[self.STATE_PROGRESS_KEY] = next_progress
+
+        super().finalize_state_progress_markers(state)
 
     schema = th.PropertiesList(
         th.Property("id", th.StringType, required=True),
