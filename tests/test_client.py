@@ -89,3 +89,27 @@ class TestGetUrlParams:
 
         mock_rkv.assert_not_called()
         assert "after" not in params
+
+    def test_next_page_token_cursor_is_not_clobbered_by_bookmark(
+        self, mock_config
+    ):
+        """Regression test: once pagination has a next_page_token, Fireblocks'
+        own cursor (carried under the same ``after`` key) MUST win. Overwriting
+        it with the static bookmark value froze pagination in production —
+        every page re-requested the same static ``after``, so the API kept
+        returning the same page forever."""
+        stream = TransactionsStream(_mock_tap(mock_config))
+        next_page_token = "https://api.fireblocks.io/v1/transactions?after=1700000000000&limit=200"
+
+        with patch.object(
+            TransactionsStream,
+            "get_starting_replication_key_value",
+            return_value=1767225600000,  # static bookmark, e.g. 2026-01-01
+        ) as mock_rkv:
+            params = stream.get_url_params(
+                context=None, next_page_token=next_page_token
+            )
+
+        mock_rkv.assert_not_called()
+        assert params["after"] == "1700000000000"
+        assert params["limit"] == "200"
