@@ -113,6 +113,60 @@ class TransactionsStream(FireblocksStream):
     #: Custom state key for forward-windowing progress.
     STATE_PROGRESS_KEY = "tx_window_start_ms"
 
+    #: Safety cap on consecutive windows fetched in a single tap invocation.
+    #: This is a guard against an infinite loop (e.g. a clock/state bug),
+    #: not a real limit on backfill length: at 24h/window it covers ~27
+    #: years of history. Real catch-up always terminates earlier, because
+    #: each window advances the bookmark strictly forward towards "now".
+    MAX_WINDOW_ITERATIONS = 10_000
+
+    def get_records(self, context):
+        """Fetch records, looping through consecutive windows until caught up.
+
+        A single Singer SDK ``sync()`` call only invokes ``get_records()``
+        once, and Fireblocks' descending order forces us to walk the
+        backfill in bounded ``WINDOW_HOURS`` windows (see class docstring).
+        Left alone, that means one tap invocation only ever advances a
+        single window — a full backfill would need to be re-invoked
+        externally once per window, which nothing in this tap (or any
+        wrapper) does.
+
+        This loops internally: fetch a window's records (all pages, via the
+        existing ``request_records``/``get_url_params`` machinery), then
+        advance (or clear) ``tx_window_start_ms`` via
+        ``finalize_state_progress_markers`` exactly as before — the only
+        difference is that this now happens once per window, in the same
+        invocation, instead of once per invocation. Each advance also
+        writes a STATE message, so a run interrupted mid-loop leaves state
+        at the last fully-completed window, never a partial one.
+        """
+        iterations = 0
+        while True:
+            yield from self.request_records(context)
+
+            state = self.get_context_state(context)
+            if state.get(self.STATE_PROGRESS_KEY) is None:
+                # Windowed backfill was never activated (e.g. no bookmark
+                # and no start_date configured) — nothing to catch up on.
+                break
+
+            self.finalize_state_progress_markers(state)
+
+            if state.get(self.STATE_PROGRESS_KEY) is None:
+                # Caught up to "now": normal incremental sync takes over.
+                break
+
+            iterations += 1
+            if iterations >= self.MAX_WINDOW_ITERATIONS:
+                msg = (
+                    f"TransactionsStream exceeded {self.MAX_WINDOW_ITERATIONS} "
+                    "consecutive backfill windows without catching up to "
+                    "'now'. Aborting to avoid an infinite loop — check "
+                    "WINDOW_HOURS, the system clock, and state["
+                    f"{self.STATE_PROGRESS_KEY!r}]."
+                )
+                raise RuntimeError(msg)
+
     def get_url_params(self, context, next_page_token) -> dict:
         # Pagination: follow next-page cursor (same logic as base class).
         if next_page_token and next_page_token.startswith("http"):
